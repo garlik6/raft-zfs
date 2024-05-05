@@ -1,4 +1,4 @@
-package main
+package zfs
 
 import (
 	"os/exec"
