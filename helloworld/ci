@@ -1,0 +1,3 @@
+go build
+scp helloworld  admin@158.160.61.51:
+scp helloworld admin@51.250.69.175:

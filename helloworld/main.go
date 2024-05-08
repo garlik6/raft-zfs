@@ -24,6 +24,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/garlik6/raft-zfs/zfs"
+	"github.com/lni/dragonboat/v4"
+	"github.com/lni/dragonboat/v4/config"
+	"github.com/lni/dragonboat/v4/logger"
+	"github.com/lni/goutils/syncutil"
+	"log"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -32,11 +39,6 @@ import (
 	"strings"
 	"syscall"
 	"time"
-
-	"github.com/lni/dragonboat/v4"
-	"github.com/lni/dragonboat/v4/config"
-	"github.com/lni/dragonboat/v4/logger"
-	"github.com/lni/goutils/syncutil"
 )
 
 const (
@@ -47,9 +49,8 @@ var (
 	// initial nodes count is fixed to three, their addresses are also fixed
 	// these are the initial member nodes of the Raft cluster.
 	addresses = []string{
-		"localhost:63001",
-		"localhost:63002",
-		"localhost:63003",
+		"10.128.0.15:63000",
+		"10.128.0.26:63000",
 	}
 	errNotMembershipChange = errors.New("not a membership change request")
 )
@@ -208,8 +209,7 @@ func main() {
 		// Other SATA enterprise class SSDs with power loss protection
 		// Recommended NVME SSDs -
 		// Most enterprise NVME currently available on the market.
-		// SSD to avoid -
-		// Consumer class SSDs, no matter whether they are SATA or NVME based, as
+		// SSD to avoid - Consumer class SSDs, no matter whether they are SATA or NVME based, as
 		// they usually have very poor fsync() performance.
 		//
 		// You can use the pg_test_fsync tool shipped with PostgreSQL to test the
@@ -271,39 +271,68 @@ func main() {
 				result, err := nh.SyncRead(ctx, exampleShardID, []byte{})
 				cancel()
 				if err == nil {
-					var count uint64
-					count = binary.LittleEndian.Uint64(result.([]byte))
-					fmt.Fprintf(os.Stdout, "count: %d\n", count)
+					var snap uint64
+					snap = binary.LittleEndian.Uint64(result.([]byte))
+					fmt.Fprintf(os.Stdout, "last snapshot in the system: %d\n", snap)
 				}
 			case <-raftStopper.ShouldStop():
 				return
 			}
 		}
 	})
+
 	raftStopper.RunWorker(func() {
+
 		// use a NO-OP client session here
 		// check the example in godoc to see how to use a regular client session
+
 		cs := nh.GetNoOPSession(exampleShardID)
 		for {
 			select {
-			case v, ok := <-ch:
+			case lastSnap, ok := <-ch: // from channel we get the number of last created snapshot
+				lastSnap = strings.Replace(lastSnap, "\n", "", 1)
 				if !ok {
 					return
 				}
-				// remove the \n char
-				msg := strings.Replace(v, "\n", "", 1)
-				if cmd, addr, replicaID, err := splitMembershipChangeCmd(msg); err == nil {
-					// input is a membership change request
-					makeMembershipChange(nh, cmd, addr, replicaID)
-				} else {
-					// input is a regular message need to be proposed
-					ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-					// make a proposal to update the IStateMachine instance
-					_, err := nh.SyncPropose(ctx, cs, []byte(msg))
-					cancel()
-					if err != nil {
-						fmt.Fprintf(os.Stderr, "SyncPropose returned error %v\n", err)
+				leader, _, _, err := nh.GetLeaderID(exampleShardID)
+				if err != nil {
+					panic(err)
+				}
+
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				membership, err := nh.SyncGetShardMembership(ctx, exampleShardID)
+				nodes := membership.Nodes
+
+				// send snapshot to slaves -> make with errorGroup
+
+				if strings.Contains(nodes[leader], getCurrentIp(nodes[leader])) {
+					println("I am leader")
+					zfs.CreateSnapshot(lastSnap)
+					for k := range nodes {
+						if k != leader {
+							if lastSnap == "1" {
+								println(nodes[k])
+								println("lastSnap = 1")
+								ip := nodes[k][:strings.IndexByte(nodes[k], ':')]
+								zfs.SendSnapshotFull(ip, lastSnap)
+							} else {
+								prev, err := strconv.Atoi(lastSnap)
+								println("lastSnap != 1")
+								if err != nil {
+									panic("snapshot number is not a number :" + strconv.Itoa(prev))
+								}
+								println("trying to send to ")
+								println(nodes[k])
+								ip := nodes[k][:strings.IndexByte(nodes[k], ':')]
+								zfs.SendSnapshotIncremental(ip, strconv.Itoa(prev-1), lastSnap)
+							}
+						}
 					}
+				}
+				_, err = nh.SyncPropose(ctx, cs, []byte(lastSnap))
+				cancel()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "SyncPropose returned error %v\n", err)
 				}
 			case <-raftStopper.ShouldStop():
 				return
@@ -311,4 +340,16 @@ func main() {
 		}
 	})
 	raftStopper.Wait()
+}
+
+func getCurrentIp(leaderconn string) string {
+	conn, err := net.Dial("tcp", leaderconn)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer conn.Close()
+
+	localAddr := conn.LocalAddr().(*net.TCPAddr)
+
+	return localAddr.IP.String()
 }

@@ -1,4 +1,4 @@
-module github.com/lni/dragonboat-example/v3
+module github.com/garlik6/raft-zfs
 
 require (
 	github.com/cockroachdb/pebble v0.0.0-20221207173255-0f086d933dac
