@@ -1,3 +1,2 @@
 go build
-scp helloworld  admin@158.160.61.51:
-scp helloworld admin@51.250.69.175:
+parallel  ::: 'scp helloworld  admin@158.160.108.153: && echo 1 ' 'scp helloworld admin@178.154.200.187: && echo 2' 'scp helloworld  admin@178.154.224.221: && echo 3'

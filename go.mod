@@ -1,9 +1,9 @@
 module github.com/garlik6/raft-zfs
 
 require (
-	github.com/cockroachdb/pebble v0.0.0-20221207173255-0f086d933dac
 	github.com/lni/dragonboat/v4 v4.0.0-20230917160253-d9f49378cd2d
 	github.com/lni/goutils v1.3.1-0.20220604063047-388d67b4dbc4
+	golang.org/x/sync v0.7.0
 )
 
 require (
@@ -14,6 +14,7 @@ require (
 	github.com/cespare/xxhash/v2 v2.1.2 // indirect
 	github.com/cockroachdb/errors v1.9.0 // indirect
 	github.com/cockroachdb/logtags v0.0.0-20211118104740-dabe8e521a4f // indirect
+	github.com/cockroachdb/pebble v0.0.0-20221207173255-0f086d933dac // indirect
 	github.com/cockroachdb/redact v1.1.3 // indirect
 	github.com/getsentry/sentry-go v0.12.0 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect

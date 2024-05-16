@@ -18,7 +18,6 @@ helloworld is an example program for dragonboat.
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -31,6 +30,7 @@ import (
 	"github.com/lni/goutils/syncutil"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -45,12 +45,11 @@ const (
 	exampleShardID uint64 = 128
 )
 
-var (
-	// initial nodes count is fixed to three, their addresses are also fixed
-	// these are the initial member nodes of the Raft cluster.
+var ( // initial nodes count is fixed to three, their addresses are also fixed these are the initial member nodes of the Raft cluster.
 	addresses = []string{
 		"10.128.0.15:63000",
 		"10.128.0.26:63000",
+		"10.128.0.10:63000",
 	}
 	errNotMembershipChange = errors.New("not a membership change request")
 )
@@ -241,28 +240,8 @@ func main() {
 		os.Exit(1)
 	}
 	raftStopper := syncutil.NewStopper()
-	consoleStopper := syncutil.NewStopper()
 	ch := make(chan string, 16)
-	consoleStopper.RunWorker(func() {
-		reader := bufio.NewReader(os.Stdin)
-		for {
-			s, err := reader.ReadString('\n')
-			if err != nil {
-				close(ch)
-				return
-			}
-			if s == "exit\n" {
-				raftStopper.Stop()
-				// no data will be lost/corrupted if nodehost.Stop() is not called
-				nh.Close()
-				return
-			}
-			ch <- s
-		}
-	})
 	raftStopper.RunWorker(func() {
-		// this goroutine makes a linearizable read every 10 second. it returns the
-		// Count value maintained in IStateMachine. see datastore.go for details.
 		ticker := time.NewTicker(10 * time.Second)
 		for {
 			select {
@@ -274,6 +253,7 @@ func main() {
 					var snap uint64
 					snap = binary.LittleEndian.Uint64(result.([]byte))
 					fmt.Fprintf(os.Stdout, "last snapshot in the system: %d\n", snap)
+					ch <- strconv.FormatInt(int64(snap+1), 10)
 				}
 			case <-raftStopper.ShouldStop():
 				return
@@ -282,64 +262,167 @@ func main() {
 	})
 
 	raftStopper.RunWorker(func() {
+		http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+			leader_id, _, has_leader, err := nh.GetLeaderID(exampleShardID)
+			if err != nil {
+				panic(err)
+			}
+			var status int
+			var message string
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			membership, err := nh.SyncGetShardMembership(ctx, exampleShardID)
+			if err != nil {
+				log.Print("error while getting Membership")
+				status = 503
+				message = "I dont have a leader"
+				w.WriteHeader(status)
+				fmt.Fprint(w, message)
+				cancel()
+				return
+			}
+			nodes := membership.Nodes
+			cancel()
 
-		// use a NO-OP client session here
-		// check the example in godoc to see how to use a regular client session
+			if !has_leader {
+				status = 503
+				message = "I dont have a leader"
+				w.WriteHeader(status)
+				fmt.Fprint(w, message)
+				return
+			}
 
-		cs := nh.GetNoOPSession(exampleShardID)
+			if isCurrentNodeLeader(nodes, leader_id) {
+				status = 200
+				message = "I am leader"
+				w.WriteHeader(status)
+				fmt.Fprint(w, message)
+				return
+			}
+
+			if !isCurrentNodeLeader(nodes, leader_id) {
+				status = 503
+				message = "I am follower"
+				w.WriteHeader(status)
+				fmt.Fprint(w, message)
+				return
+			}
+		})
+		http.ListenAndServe(":9999", nil)
+	})
+
+	raftStopper.RunWorker(func() {
+		ticker := time.NewTicker(10 * time.Second)
 		for {
 			select {
-			case lastSnap, ok := <-ch: // from channel we get the number of last created snapshot
-				lastSnap = strings.Replace(lastSnap, "\n", "", 1)
-				if !ok {
-					return
+			case <-ticker.C:
+				leader_id, _, has_leader, err := nh.GetLeaderID(exampleShardID)
+				if !has_leader {
+					log.Print("cant contact any nodes! remounting to ro")
+					zfs.SetRO()
+					break
 				}
-				leader, _, _, err := nh.GetLeaderID(exampleShardID)
 				if err != nil {
+					log.Print("error while getting leaderID")
 					panic(err)
 				}
-
 				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 				membership, err := nh.SyncGetShardMembership(ctx, exampleShardID)
-				nodes := membership.Nodes
-
-				// send snapshot to slaves -> make with errorGroup
-
-				if strings.Contains(nodes[leader], getCurrentIp(nodes[leader])) {
-					println("I am leader")
-					zfs.CreateSnapshot(lastSnap)
-					for k := range nodes {
-						if k != leader {
-							if lastSnap == "1" {
-								println(nodes[k])
-								println("lastSnap = 1")
-								ip := nodes[k][:strings.IndexByte(nodes[k], ':')]
-								zfs.SendSnapshotFull(ip, lastSnap)
-							} else {
-								prev, err := strconv.Atoi(lastSnap)
-								println("lastSnap != 1")
-								if err != nil {
-									panic("snapshot number is not a number :" + strconv.Itoa(prev))
-								}
-								println("trying to send to ")
-								println(nodes[k])
-								ip := nodes[k][:strings.IndexByte(nodes[k], ':')]
-								zfs.SendSnapshotIncremental(ip, strconv.Itoa(prev-1), lastSnap)
-							}
-						}
-					}
-				}
-				_, err = nh.SyncPropose(ctx, cs, []byte(lastSnap))
-				cancel()
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "SyncPropose returned error %v\n", err)
+					log.Print("error while getting Membership")
+					cancel()
+					break
+				}
+				nodes := membership.Nodes
+				cancel()
+				// send snapshot to slaves -> make with errorGroup propose to dragon boat only if at least 2 are succsessful
+				if isCurrentNodeLeader(nodes, leader_id) {
+					log.Print("I am leader")
+					mountStatus, err := zfs.CheckMountStatus()
+					log.Print(mountStatus)
+					if err != nil {
+						log.Print(err)
+						panic(err)
+					}
+					if mountStatus != "RW" {
+						log.Print("remounting rw")
+						zfs.SetRW()
+					}
+				} else {
+					log.Print("I am follower")
+					mountStatus, err := zfs.CheckMountStatus()
+					log.Print(mountStatus)
+					if err != nil {
+						log.Print(err)
+						panic(err)
+					}
+					if mountStatus != "RO" {
+						log.Print("remounting ro")
+						zfs.SetRO()
+					}
 				}
 			case <-raftStopper.ShouldStop():
 				return
 			}
 		}
 	})
+
+	raftStopper.RunWorker(func() {
+		// use a NO-OP client session here
+		// check the example in godoc to see how to use a regular client session
+		cs := nh.GetNoOPSession(exampleShardID)
+		for {
+			select {
+			case newSnap, ok := <-ch: // from channel we get the number of last created snapshot
+
+				logs := make(chan string)
+				if !ok {
+					return
+				}
+				newSnap = strings.Replace(newSnap, "\n", "", 1)
+				leader_id, _, _, err := nh.GetLeaderID(exampleShardID)
+				if err != nil {
+					panic(err)
+				}
+				// get list of nodes
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				membership, err := nh.SyncGetShardMembership(ctx, exampleShardID)
+				nodes := membership.Nodes
+
+				// send snapshot to slaves -> make with errorGroup propose to dragon boat only if at least 2 are succsessful
+				if isCurrentNodeLeader(nodes, leader_id) {
+					println("I am leader")
+					// if error creating snapshot retry and exit gracefully
+					err = zfs.CreateSnapshot(newSnap, logs)
+					if err != nil {
+						log.Print("Failed to create snapshot exiting...")
+						log.Fatal(err)
+					}
+					err = sendUpToSnapFromLeaderToFolowers(leader_id, newSnap, nodes)
+					if err != nil {
+						log.Fatal(err)
+					}
+					_, err = nh.SyncPropose(ctx, cs, []byte(newSnap))
+					cancel()
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "SyncPropose returned error %v\n", err)
+						err = zfs.DestroySnapshot(newSnap)
+						if err != nil {
+							fmt.Fprintf(os.Stderr, "Failed to destroy snapshot\n", err)
+							log.Fatal(err)
+						}
+					}
+				}
+				cancel()
+			case <-raftStopper.ShouldStop():
+				return
+			}
+		}
+	})
 	raftStopper.Wait()
+}
+
+func isCurrentNodeLeader(nodes map[uint64]string, leader_id uint64) bool {
+	return strings.Contains(nodes[leader_id], getCurrentIp(nodes[leader_id]))
 }
 
 func getCurrentIp(leaderconn string) string {
@@ -352,4 +435,47 @@ func getCurrentIp(leaderconn string) string {
 	localAddr := conn.LocalAddr().(*net.TCPAddr)
 
 	return localAddr.IP.String()
+}
+
+func sendUpToSnapFromLeaderToFolowers(leader_id uint64, newSnap string, nodes map[uint64]string) error {
+	successfulCount := 0
+	for node_id := range nodes {
+		log.Print(strconv.Itoa(int(node_id)) + " " + nodes[node_id])
+		if node_id != leader_id {
+			ip := nodes[node_id][:strings.IndexByte(nodes[node_id], ':')]
+			lastSnapOnNode, err := zfs.GetLastSnapNumber(ip)
+			if err != nil {
+				log.Print("unable to get last snap on " + ip)
+				break
+			}
+			log.Print("trying to send to:")
+			log.Print(nodes[node_id])
+			if lastSnapOnNode == "-1" {
+				err := zfs.SendSnapshotFull(ip, newSnap)
+				if err != nil {
+					log.Print("unable to send full snapshot")
+					break
+				}
+				successfulCount++
+			} else {
+				log.Print("on " + ip + "last snap on this node is: " + lastSnapOnNode)
+				err = zfs.SendSnapshotIncremental(ip, lastSnapOnNode, newSnap)
+				if err != nil {
+					log.Print("unable to send snapshot incremental")
+					log.Print("sending snapshot full")
+					err := zfs.SendSnapshotFull(ip, newSnap)
+					if err != nil {
+						log.Print("unable to send full snapshot")
+						break
+					}
+					break
+				}
+				successfulCount++
+			}
+		}
+	}
+	if successfulCount == 0 {
+		return fmt.Errorf("was not able to send snapshot to all slaves")
+	}
+	return nil
 }
