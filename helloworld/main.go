@@ -1,7 +1,5 @@
 // Copyright 2017,2018 Lei Ni (nilei81@gmail.com).
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,11 +21,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/garlik6/raft-zfs/zfs"
-	"github.com/lni/dragonboat/v4"
-	"github.com/lni/dragonboat/v4/config"
-	"github.com/lni/dragonboat/v4/logger"
-	"github.com/lni/goutils/syncutil"
 	"log"
 	"net"
 	"net/http"
@@ -37,8 +30,16 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+
+	"github.com/garlik6/raft-zfs/zfs"
+	"github.com/lni/dragonboat/v4"
+	"github.com/lni/dragonboat/v4/client"
+	"github.com/lni/dragonboat/v4/config"
+	"github.com/lni/dragonboat/v4/logger"
+	"github.com/lni/goutils/syncutil"
 )
 
 const (
@@ -109,6 +110,89 @@ func splitMembershipChangeCmd(v string) (string, string, uint64, error) {
 		return cmd, addr, replicaID, nil
 	}
 	return "", "", 0, errNotMembershipChange
+}
+
+type SafeSnapshoter struct {
+	mu sync.Mutex
+}
+
+func (c *SafeSnapshoter) runSnapshotCycle(nh *dragonboat.NodeHost, newSnap string, cs *client.Session) {
+	// get list of nodes
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	membership, err := nh.SyncGetShardMembership(ctx, exampleShardID)
+	if err != nil {
+		log.Print("error while getting Membership")
+	}
+	nodes := membership.Nodes
+
+	newSnap = strings.Replace(newSnap, "\n", "", 1)
+	leader_id, _, _, err := nh.GetLeaderID(exampleShardID)
+	if err != nil {
+		panic(err)
+	}
+
+	if isCurrentNodeLeader(nodes, leader_id) {
+		println("I am leader")
+		println("checking if I have the latest snapshot")
+		ctx, cancel2 := context.WithTimeout(context.Background(), 3*time.Second)
+		result, err := nh.SyncRead(ctx, exampleShardID, []byte{})
+		cancel2()
+		var lastSnapInRaft uint64
+		if err == nil {
+			lastSnapInRaft = binary.LittleEndian.Uint64(result.([]byte))
+		} else {
+			log.Print("can't get last snapshot in the system")
+			return
+		}
+
+		lastSnapOnNode, err := zfs.GetLastSnapNumber(getCurrentIp(nodes[leader_id]))
+		if lastSnapOnNode != strconv.Itoa(int(lastSnapInRaft)) {
+			log.Print("I don't have the latest snapshot!(", lastSnapInRaft, ") cant create new one!")
+			nodeToBecomeLeader, err := getIdOfNodeWithLastSnapshotInRaft(strconv.Itoa(int(lastSnapInRaft)), nodes)
+			if err != nil {
+				log.Fatal("No node has last snapshot" + fmt.Sprint(lastSnapInRaft))
+			} else {
+				err := changeLeaderToNode(nh, exampleShardID, nodeToBecomeLeader)
+				if err != nil {
+					log.Print("Unable to transfer leadership to node with last snap in raft")
+					return
+				}
+			}
+			return
+		} else {
+			log.Print("I have the latest snapshot!")
+		}
+
+		// if error creating snapshot retry and exit gracefully
+		err, exists := zfs.CreateSnapshot(newSnap)
+		if exists {
+			return
+		}
+		if err != nil {
+			log.Print("Failed to create snapshot exiting...")
+			log.Fatal(err)
+		}
+		err = sendUpToSnapFromLeaderToFolowers(leader_id, newSnap, nodes)
+		if err != nil {
+			cancel2()
+			return
+		}
+		ctx3, cancel3 := context.WithTimeout(context.Background(), 3*time.Second)
+		_, err = nh.SyncPropose(ctx3, cs, []byte(newSnap))
+		cancel3()
+		cancel2()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "SyncPropose returned error %v\n", err)
+			err = zfs.DestroySnapshot(newSnap)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to destroy snapshot\n", err)
+				log.Fatal(err)
+			}
+		}
+	}
 }
 
 func main() {
@@ -242,7 +326,7 @@ func main() {
 	raftStopper := syncutil.NewStopper()
 	ch := make(chan string, 16)
 	raftStopper.RunWorker(func() {
-		ticker := time.NewTicker(10 * time.Second)
+		ticker := time.NewTicker(20 * time.Second)
 		for {
 			select {
 			case <-ticker.C:
@@ -341,7 +425,8 @@ func main() {
 					log.Print(mountStatus)
 					if err != nil {
 						log.Print(err)
-						panic(err)
+						zfs.MountPool()
+						break
 					}
 					if mountStatus != "RW" {
 						log.Print("remounting rw")
@@ -353,7 +438,6 @@ func main() {
 					log.Print(mountStatus)
 					if err != nil {
 						log.Print(err)
-						panic(err)
 					}
 					if mountStatus != "RO" {
 						log.Print("remounting ro")
@@ -366,53 +450,16 @@ func main() {
 		}
 	})
 
+	snapshoter := SafeSnapshoter{}
 	raftStopper.RunWorker(func() {
-		// use a NO-OP client session here
-		// check the example in godoc to see how to use a regular client session
 		cs := nh.GetNoOPSession(exampleShardID)
 		for {
 			select {
-			case newSnap, ok := <-ch: // from channel we get the number of last created snapshot
-
-				logs := make(chan string)
+			case newSnap, ok := <-ch: // from channel we get the number of new snapshot to create
+				snapshoter.runSnapshotCycle(nh, newSnap, cs)
 				if !ok {
 					return
 				}
-				newSnap = strings.Replace(newSnap, "\n", "", 1)
-				leader_id, _, _, err := nh.GetLeaderID(exampleShardID)
-				if err != nil {
-					panic(err)
-				}
-				// get list of nodes
-				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-				membership, err := nh.SyncGetShardMembership(ctx, exampleShardID)
-				nodes := membership.Nodes
-
-				// send snapshot to slaves -> make with errorGroup propose to dragon boat only if at least 2 are succsessful
-				if isCurrentNodeLeader(nodes, leader_id) {
-					println("I am leader")
-					// if error creating snapshot retry and exit gracefully
-					err = zfs.CreateSnapshot(newSnap, logs)
-					if err != nil {
-						log.Print("Failed to create snapshot exiting...")
-						log.Fatal(err)
-					}
-					err = sendUpToSnapFromLeaderToFolowers(leader_id, newSnap, nodes)
-					if err != nil {
-						log.Fatal(err)
-					}
-					_, err = nh.SyncPropose(ctx, cs, []byte(newSnap))
-					cancel()
-					if err != nil {
-						fmt.Fprintf(os.Stderr, "SyncPropose returned error %v\n", err)
-						err = zfs.DestroySnapshot(newSnap)
-						if err != nil {
-							fmt.Fprintf(os.Stderr, "Failed to destroy snapshot\n", err)
-							log.Fatal(err)
-						}
-					}
-				}
-				cancel()
 			case <-raftStopper.ShouldStop():
 				return
 			}
@@ -437,6 +484,28 @@ func getCurrentIp(leaderconn string) string {
 	return localAddr.IP.String()
 }
 
+func changeLeaderToNode(nh *dragonboat.NodeHost, shardId uint64, nodeId uint64) error {
+	err := nh.RequestLeaderTransfer(shardId, nodeId)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func getIdOfNodeWithLastSnapshotInRaft(lastSnapInRaft string, nodes map[uint64]string) (uint64, error) {
+	for nodeId := range nodes {
+		ip := nodes[nodeId][:strings.IndexByte(nodes[nodeId], ':')]
+		lastSnapOnNode, err := zfs.GetLastSnapNumber(ip)
+		if err != nil {
+			continue
+		}
+		if lastSnapOnNode == lastSnapInRaft {
+			return nodeId, nil
+		}
+	}
+	return 0, fmt.Errorf("No nodes with last snapshot exiting!")
+}
+
 func sendUpToSnapFromLeaderToFolowers(leader_id uint64, newSnap string, nodes map[uint64]string) error {
 	successfulCount := 0
 	for node_id := range nodes {
@@ -446,35 +515,57 @@ func sendUpToSnapFromLeaderToFolowers(leader_id uint64, newSnap string, nodes ma
 			lastSnapOnNode, err := zfs.GetLastSnapNumber(ip)
 			if err != nil {
 				log.Print("unable to get last snap on " + ip)
-				break
+				continue
 			}
 			log.Print("trying to send to:")
 			log.Print(nodes[node_id])
-			if lastSnapOnNode == "-1" {
-				err := zfs.SendSnapshotFull(ip, newSnap)
+			if lastSnapOnNode == "0" {
+				locked, err := zfs.CheckLock(ip)
+				if locked {
+					log.Print("pool is locked continue...")
+					continue
+				}
+				if locked {
+					log.Print("##########################################")
+				}
+				zfs.LockPool(ip)
+				err = zfs.SendSnapshotFull(ip, newSnap)
+				zfs.UnlockPool(ip)
 				if err != nil {
 					log.Print("unable to send full snapshot")
-					break
+					continue
 				}
 				successfulCount++
 			} else {
 				log.Print("on " + ip + "last snap on this node is: " + lastSnapOnNode)
-				err = zfs.SendSnapshotIncremental(ip, lastSnapOnNode, newSnap)
+				err, locked := zfs.SendSnapshotIncremental(ip, lastSnapOnNode, newSnap)
+				if locked {
+					continue
+				}
 				if err != nil {
-					log.Print("unable to send snapshot incremental")
-					log.Print("sending snapshot full")
-					err := zfs.SendSnapshotFull(ip, newSnap)
+					locked, err := zfs.CheckLock(ip)
+					if locked {
+						log.Print("pool is locked continue...")
+						continue
+					}
+					if locked {
+						log.Print("##########################################")
+					}
+					zfs.LockPool(ip)
+					err = zfs.SendSnapshotFull(ip, newSnap)
+					zfs.UnlockPool(ip)
 					if err != nil {
 						log.Print("unable to send full snapshot")
-						break
+						continue
 					}
-					break
 				}
 				successfulCount++
 			}
 		}
 	}
 	if successfulCount == 0 {
+		zfs.DestroySnapshot(newSnap)
+		log.Print("was not able to send snapshot to all slaves")
 		return fmt.Errorf("was not able to send snapshot to all slaves")
 	}
 	return nil
